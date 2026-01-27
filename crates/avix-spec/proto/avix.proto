@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package avix.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+service JobService {
+    rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+    rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+    rpc GetJobLogs(GetJobLogsRequest) returns (stream LogLine);
+    rpc GetJobMetrics(GetJobMetricsRequest) returns (stream MetricPoint);
+    rpc EstimateCost(EstimateCostRequest) returns (EstimateCostResponse);
+    rpc StopJob(StopJobRequest) returns (StopJobResponse);
+}
+
+message SubmitJobRequest {
+    string job_spec_yaml = 1;
+}
+
+message SubmitJobResponse {
+    string job_id = 1;
+    string status = 2;
+}
+
+message ListJobsRequest {
+    string namespace = 1;
+}
+
+message ListJobsResponse {
+    repeated JobSummary jobs = 1;
+}
+
+message JobSummary {
+    string id = 1;
+    string name = 2;
+    string status = 3;
+    google.protobuf.Timestamp created_at = 4;
+}
+
+message GetJobLogsRequest {
+    string job_id = 1;
+    bool follow = 2;
+}
+
+message LogLine {
+    string content = 1;
+    google.protobuf.Timestamp timestamp = 2;
+    string stream = 3; // stdout or stderr
+}
+
+message GetJobMetricsRequest {
+    string job_id = 1;
+}
+
+message MetricPoint {
+    string name = 1;
+    double value = 2;
+    google.protobuf.Timestamp timestamp = 3;
+}
+
+message EstimateCostRequest {
+    string job_spec_yaml = 1;
+}
+
+message EstimateCostResponse {
+    double estimated_cost_usd = 1;
+    string currency = 2;
+}
+
+message StopJobRequest {
+    string job_id = 1;
+}
+
+message StopJobResponse {
+    bool success = 1;
+}

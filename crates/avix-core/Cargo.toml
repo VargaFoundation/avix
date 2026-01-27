@@ -1,0 +1,18 @@
+[package]
+name = "avix-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+avix-spec = { path = "../avix-spec" }
+async_trait = "0.1"
+bollard = "0.15"
+tokio = { version = "1.35", features = ["full"] }
+anyhow = "1.0"
+futures-util = "0.3"
+tonic = "0.10"
+prost = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+chrono = "0.4"
+rand = "0.8"

@@ -1,0 +1,9 @@
+apiVersion: avix.vargafoundation.org/v1alpha1
+kind: Job
+metadata:
+  name: hello-world
+spec:
+  backend: local-docker
+  execution:
+    image: alpine
+    command: ["echo", "Hello from Avix!"]

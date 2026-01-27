@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/avix-spec",
+    "crates/avix-cli",
+    "crates/avix-core",
+]
+resolver = "2"
