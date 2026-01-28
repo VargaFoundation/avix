@@ -69,10 +69,12 @@ impl Backend for DockerBackend {
 
     async fn list(&self, namespace: Option<&str>) -> Result<Vec<JobStatus>> {
         let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec!["managed-by=avix".to_string()]);
+        // Combine label filters in a single vec so we don't overwrite the previous one
+        let mut label_filters = vec!["managed-by=avix".to_string()];
         if let Some(ns) = namespace {
-            filters.insert("label".to_string(), vec![format!("avix-namespace={}", ns)]);
+            label_filters.push(format!("avix-namespace={}", ns));
         }
+        filters.insert("label".to_string(), label_filters);
 
         let options = Some(ListContainersOptions {
             all: true,

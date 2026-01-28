@@ -136,17 +136,22 @@ impl JobService for AvixServer {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let metric = MetricPoint {
-                    name: "cpu_usage".to_string(),
-                    value: 45.0 + (rand::random::<f64>() * 10.0), // Fake metric
-                    timestamp: Some(prost_types::Timestamp {
-                        seconds: chrono::Utc::now().timestamp(),
-                        nanos: 0,
-                    }),
+                let now = chrono::Utc::now().timestamp();
+                // Simulated CPU metric
+                let cpu = MetricPoint {
+                    name: "cpu".to_string(),
+                    value: 45.0 + (rand::random::<f64>() * 10.0),
+                    timestamp: Some(prost_types::Timestamp { seconds: now, nanos: 0 }),
                 };
-                if tx.send(Ok(metric)).await.is_err() {
-                    break;
-                }
+                if tx.send(Ok(cpu)).await.is_err() { break; }
+
+                // Simulated Memory metric
+                let mem = MetricPoint {
+                    name: "memory".to_string(),
+                    value: 60.0 + (rand::random::<f64>() * 15.0),
+                    timestamp: Some(prost_types::Timestamp { seconds: now, nanos: 0 }),
+                };
+                if tx.send(Ok(mem)).await.is_err() { break; }
             }
         });
 
@@ -155,10 +160,37 @@ impl JobService for AvixServer {
 
     async fn estimate_cost(
         &self,
-        _request: Request<EstimateCostRequest>,
+        request: Request<EstimateCostRequest>,
     ) -> Result<Response<EstimateCostResponse>, Status> {
+        let req = request.into_inner();
+        let job: avix_spec::Job = serde_yaml::from_str(&req.job_spec_yaml)
+            .map_err(|e| Status::invalid_argument(format!("Invalid YAML: {}", e)))?;
+
+        let backend_name = job.spec.backend.as_deref().unwrap_or("auto");
+
+        // Extract resources
+        let (cpu, memory_gi, gpu) = if let Some(ref res) = job.spec.resources {
+            (
+                res.cpu.as_deref().unwrap_or("1").parse::<f64>().unwrap_or(1.0),
+                parse_memory_gi(res.memory.as_deref().unwrap_or("1Gi")),
+                res.gpu.unwrap_or(0) as f64,
+            )
+        } else {
+            (1.0, 1.0, 0.0)
+        };
+
+        let hourly = match backend_name {
+            "local-docker" => 0.0,
+            "aws-lambda" => cpu * 0.0000166667 * 3600.0 + memory_gi * 0.0000002501 * 3600.0, // per hour equivalent
+            "aws-batch" => cpu * 0.04 + memory_gi * 0.004 + gpu * 2.5,
+            "k8s-job" | "kubernetes" => cpu * 0.03 + memory_gi * 0.003 + gpu * 2.0,
+            "gcp-cloudrun" => cpu * 0.024 + memory_gi * 0.0025,
+            "azure-batch" => cpu * 0.035 + memory_gi * 0.0035 + gpu * 2.3,
+            _ => cpu * 0.05 + memory_gi * 0.005 + gpu * 2.5,
+        };
+
         Ok(Response::new(EstimateCostResponse {
-            estimated_cost_usd: 0.0,
+            estimated_cost_usd: hourly,
             currency: "USD".to_string(),
         }))
     }
@@ -172,6 +204,32 @@ impl JobService for AvixServer {
             .map_err(|e| Status::internal(format!("Failed to stop job: {}", e)))?;
 
         Ok(Response::new(StopJobResponse { success: true }))
+    }
+}
+
+fn parse_memory_gi(mem: &str) -> f64 {
+    let mem = mem.trim();
+    if let Some(rest) = mem.strip_suffix("Gi") {
+        rest.parse().unwrap_or(1.0)
+    } else if let Some(rest) = mem.strip_suffix("Mi") {
+        rest.parse::<f64>().unwrap_or(1024.0) / 1024.0
+    } else if let Some(rest) = mem.strip_suffix("G") {
+        rest.parse().unwrap_or(1.0)
+    } else {
+        mem.parse().unwrap_or(1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_memory_gi;
+
+    #[test]
+    fn test_parse_memory_gi() {
+        assert!((parse_memory_gi("1Gi") - 1.0).abs() < 1e-6);
+        assert!((parse_memory_gi("512Mi") - 0.5).abs() < 1e-6);
+        assert!((parse_memory_gi("2G") - 2.0).abs() < 1e-6);
+        assert!((parse_memory_gi("3") - 3.0).abs() < 1e-6);
     }
 }
 

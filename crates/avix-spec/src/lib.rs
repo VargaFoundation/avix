@@ -25,9 +25,18 @@ pub struct JobSpec {
     pub queue: Option<String>,
     pub priority: Option<i32>,
     pub resources: Option<Resources>,
+    pub affinity: Option<Affinity>,
+    pub tolerations: Option<Vec<Toleration>>,
+    #[serde(rename = "type")]
+    pub job_type: Option<String>,
     pub execution: Execution,
     pub ml_tracking: Option<MlTracking>,
     pub hyperparams: Option<Hyperparams>,
+    pub dependencies: Option<Vec<Dependency>>,
+    pub scaling: Option<Scaling>,
+    pub cost_budget: Option<f64>,
+    pub restart_policy: Option<String>,
+    pub ttl_seconds_after_finished: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -46,6 +55,8 @@ pub struct Execution {
     pub command: Vec<String>,
     pub args: Option<Vec<String>>,
     pub env: Option<Vec<EnvVar>>,
+    pub volumes: Option<Vec<Volume>>,
+    pub requirements: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -86,6 +97,86 @@ pub struct MlflowConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Hyperparams {
     pub grid: Option<HashMap<String, Vec<serde_json::Value>>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Affinity {
+    pub node_labels: Option<HashMap<String, String>>,
+    pub anti_affinity: Option<AntiAffinity>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AntiAffinity {
+    pub job_labels: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Toleration {
+    pub key: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Dependency {
+    pub job: String,
+    pub on: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Scaling {
+    pub min_instances: Option<u32>,
+    pub max_instances: Option<u32>,
+    pub metric: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Volume {
+    pub name: String,
+    pub s3: Option<S3Volume>,
+    pub gcs: Option<GcsVolume>,
+    pub azure_blob: Option<AzureBlobVolume>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct S3Volume {
+    pub bucket: String,
+    pub path: Option<String>,
+    pub mount_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GcsVolume {
+    pub bucket: String,
+    pub path: Option<String>,
+    pub mount_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureBlobVolume {
+    pub container: String,
+    pub path: Option<String>,
+    pub mount_path: String,
+}
+
+/// Queue configuration for job scheduling
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueConfig {
+    pub name: String,
+    pub priority: Option<i32>,
+    pub max_resources: Option<Resources>,
+    pub scheduler: Option<String>,
+    pub preemption: Option<bool>,
+    pub burst_to: Option<String>,
 }
 
 pub mod v1 {
