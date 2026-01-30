@@ -44,12 +44,7 @@ impl Backend for DockerBackend {
             labels.insert("avix-namespace".to_string(), ns.clone());
         }
 
-        let config = Config {
-            image: Some(job.spec.execution.image.clone()),
-            cmd: Some(job.spec.execution.command.clone()),
-            labels: Some(labels),
-            ..Default::default()
-        };
+        let config = build_container_config(&job, labels);
 
         let options = Some(CreateContainerOptions {
             name: job.metadata.name.clone(),
@@ -126,6 +121,158 @@ impl Backend for DockerBackend {
         });
 
         Ok(rx)
+    }
+}
+
+fn build_container_config(job: &Job, labels: HashMap<String, String>) -> Config<String> {
+    let mut cmd = job.spec.execution.command.clone();
+    if let Some(args) = &job.spec.execution.args {
+        cmd.extend(args.clone());
+    }
+
+    let env = job
+        .spec
+        .execution
+        .env
+        .as_ref()
+        .map(|vars| {
+            vars.iter()
+                .filter_map(|v| v.value.as_ref().map(|val| format!("{}={}", v.name, val)))
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+
+    Config {
+        image: Some(job.spec.execution.image.clone()),
+        cmd: Some(cmd),
+        env,
+        labels: Some(labels),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_container_config;
+    use avix_spec::{EnvVar, Execution, Job, JobSpec, Metadata, Resources};
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_build_container_config_cmd_includes_args() {
+        let job = Job {
+            api_version: "v1".to_string(),
+            kind: "Job".to_string(),
+            metadata: Metadata {
+                name: "t".to_string(),
+                namespace: None,
+                labels: None,
+            },
+            spec: JobSpec {
+                backend: None,
+                queue: None,
+                priority: None,
+                resources: Some(Resources {
+                    cpu: None,
+                    memory: None,
+                    gpu: None,
+                    disk: None,
+                }),
+                affinity: None,
+                tolerations: None,
+                job_type: None,
+                execution: Execution {
+                    image: "alpine".to_string(),
+                    command: vec!["echo".to_string()],
+                    args: Some(vec!["hello".to_string(), "world".to_string()]),
+                    env: None,
+                    volumes: None,
+                    requirements: None,
+                },
+                ml_tracking: None,
+                hyperparams: None,
+                dependencies: None,
+                scaling: None,
+                cost_budget: None,
+                restart_policy: None,
+                ttl_seconds_after_finished: None,
+            },
+        };
+
+        let cfg = build_container_config(&job, HashMap::new());
+        assert_eq!(
+            cfg.cmd.unwrap(),
+            vec!["echo".to_string(), "hello".to_string(), "world".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_container_config_env_maps_key_values() {
+        let job = Job {
+            api_version: "v1".to_string(),
+            kind: "Job".to_string(),
+            metadata: Metadata {
+                name: "t".to_string(),
+                namespace: None,
+                labels: None,
+            },
+            spec: JobSpec {
+                backend: None,
+                queue: None,
+                priority: None,
+                resources: Some(Resources {
+                    cpu: None,
+                    memory: None,
+                    gpu: None,
+                    disk: None,
+                }),
+                affinity: None,
+                tolerations: None,
+                job_type: None,
+                execution: Execution {
+                    image: "alpine".to_string(),
+                    command: vec!["env".to_string()],
+                    args: None,
+                    env: Some(vec![
+                        EnvVar {
+                            name: "A".to_string(),
+                            value: Some("1".to_string()),
+                            value_from: None,
+                        },
+                        EnvVar {
+                            name: "B".to_string(),
+                            value: Some("two".to_string()),
+                            value_from: None,
+                        },
+                        // secret-backed env var: ignored by docker backend for now
+                        EnvVar {
+                            name: "SECRET".to_string(),
+                            value: None,
+                            value_from: Some(avix_spec::ValueFrom {
+                                secret_ref: avix_spec::SecretRef {
+                                    name: "s".to_string(),
+                                },
+                            }),
+                        },
+                    ]),
+                    volumes: None,
+                    requirements: None,
+                },
+                ml_tracking: None,
+                hyperparams: None,
+                dependencies: None,
+                scaling: None,
+                cost_budget: None,
+                restart_policy: None,
+                ttl_seconds_after_finished: None,
+            },
+        };
+
+        let cfg = build_container_config(&job, HashMap::new());
+        let env = cfg.env.unwrap();
+
+        assert!(env.contains(&"A=1".to_string()));
+        assert!(env.contains(&"B=two".to_string()));
+        assert!(!env.iter().any(|e| e.starts_with("SECRET=")));
     }
 }
 

@@ -8,6 +8,7 @@ import "google/protobuf/struct.proto";
 service JobService {
     rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
     rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+    rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
     rpc GetJobLogs(GetJobLogsRequest) returns (stream LogLine);
     rpc GetJobMetrics(GetJobMetricsRequest) returns (stream MetricPoint);
     rpc EstimateCost(EstimateCostRequest) returns (EstimateCostResponse);
@@ -32,6 +33,17 @@ message ListJobsResponse {
 }
 
 message JobSummary {
+    string id = 1;
+    string name = 2;
+    string status = 3;
+    google.protobuf.Timestamp created_at = 4;
+}
+
+message GetJobStatusRequest {
+    string job_id = 1;
+}
+
+message GetJobStatusResponse {
     string id = 1;
     string name = 2;
     string status = 3;

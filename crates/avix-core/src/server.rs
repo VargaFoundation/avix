@@ -5,18 +5,38 @@ use crate::{Backend, DockerBackend};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 pub struct AvixServer {
     backend: Arc<dyn Backend + Send + Sync>,
-    queue: Arc<Mutex<VecDeque<avix_spec::Job>>>,
+    queue: Arc<Mutex<VecDeque<QueuedJob>>>,
+    queued_meta: Arc<Mutex<HashMap<String, QueuedMeta>>>,
+    id_map: Arc<Mutex<HashMap<String, String>>>,
+}
+
+#[derive(Clone)]
+struct QueuedJob {
+    queued_id: String,
+    job: avix_spec::Job,
+    enqueued_at: i64,
+}
+
+#[derive(Clone)]
+struct QueuedMeta {
+    name: String,
+    status: String,
+    created_at: i64,
 }
 
 impl AvixServer {
     pub fn new(backend: Arc<dyn Backend + Send + Sync>) -> Self {
         let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queued_meta = Arc::new(Mutex::new(HashMap::new()));
+        let id_map = Arc::new(Mutex::new(HashMap::new()));
         let backend_clone = backend.clone();
         let queue_clone = queue.clone();
+        let queued_meta_clone = queued_meta.clone();
+        let id_map_clone = id_map.clone();
 
         // simple queue worker
         tokio::spawn(async move {
@@ -26,10 +46,29 @@ impl AvixServer {
                     q.pop_front()
                 };
 
-                if let Some(job) = job {
-                    println!("Processing job from queue: {}", job.metadata.name);
-                    if let Err(e) = backend_clone.submit(job).await {
-                        eprintln!("Failed to process job from queue: {}", e);
+                if let Some(queued) = job {
+                    {
+                        let mut meta = queued_meta_clone.lock().await;
+                        if let Some(m) = meta.get_mut(&queued.queued_id) {
+                            m.status = "running".to_string();
+                        }
+                    }
+
+                    println!("Processing job from queue: {}", queued.job.metadata.name);
+                    match backend_clone.submit(queued.job).await {
+                        Ok(backend_id) => {
+                            let mut map = id_map_clone.lock().await;
+                            map.insert(queued.queued_id, backend_id);
+                        }
+                        Err(e) => {
+                            {
+                                let mut meta = queued_meta_clone.lock().await;
+                                if let Some(m) = meta.get_mut(&queued.queued_id) {
+                                    m.status = "failed".to_string();
+                                }
+                            }
+                            eprintln!("Failed to process job from queue: {}", e);
+                        }
                     }
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -37,8 +76,17 @@ impl AvixServer {
             }
         });
 
-        Self { backend, queue }
+        Self {
+            backend,
+            queue,
+            queued_meta,
+            id_map,
+        }
     }
+}
+
+fn generate_queued_id() -> String {
+    format!("q-{:x}", rand::random::<u64>())
 }
 
 #[tonic::async_trait]
@@ -62,10 +110,29 @@ impl JobService for AvixServer {
                 status: "SUBMITTED".to_string(),
             }))
         } else {
+            let queued_id = generate_queued_id();
+            let now = chrono::Utc::now().timestamp();
+
+            {
+                let mut meta = self.queued_meta.lock().await;
+                meta.insert(
+                    queued_id.clone(),
+                    QueuedMeta {
+                        name: job.metadata.name.clone(),
+                        status: "queued".to_string(),
+                        created_at: now,
+                    },
+                );
+            }
+
             let mut q = self.queue.lock().await;
-            q.push_back(job);
+            q.push_back(QueuedJob {
+                queued_id: queued_id.clone(),
+                job,
+                enqueued_at: now,
+            });
             Ok(Response::new(SubmitJobResponse {
-                job_id: "queued".to_string(),
+                job_id: queued_id,
                 status: "QUEUED".to_string(),
             }))
         }
@@ -76,8 +143,19 @@ impl JobService for AvixServer {
         request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsResponse>, Status> {
         let req = request.into_inner();
-        let jobs = self.backend.list(Some(&req.namespace).filter(|s| !s.is_empty())).await
+        let mut jobs = self.backend.list(Some(&req.namespace).filter(|s| !s.is_empty())).await
             .map_err(|e| Status::internal(format!("Failed to list jobs: {}", e)))?;
+
+        // Add queued jobs (in-memory)
+        let queued = self.queued_meta.lock().await;
+        for (id, meta) in queued.iter() {
+            jobs.push(crate::JobStatus {
+                id: id.clone(),
+                name: meta.name.clone(),
+                status: meta.status.clone(),
+                created_at: meta.created_at,
+            });
+        }
 
         let summaries = jobs.into_iter().map(|j| JobSummary {
             id: j.id,
@@ -90,6 +168,58 @@ impl JobService for AvixServer {
         }).collect();
 
         Ok(Response::new(ListJobsResponse { jobs: summaries }))
+    }
+
+    async fn get_job_status(
+        &self,
+        request: Request<GetJobStatusRequest>,
+    ) -> Result<Response<GetJobStatusResponse>, Status> {
+        let req = request.into_inner();
+
+        // If it's a queued id that already mapped to a backend id, resolve it.
+        let resolved_id = {
+            let map = self.id_map.lock().await;
+            map.get(&req.job_id).cloned()
+        };
+
+        // If still queued and not started yet, return in-memory status.
+        if resolved_id.is_none() {
+            let meta = self.queued_meta.lock().await;
+            if let Some(m) = meta.get(&req.job_id) {
+                return Ok(Response::new(GetJobStatusResponse {
+                    id: req.job_id,
+                    name: m.name.clone(),
+                    status: m.status.clone(),
+                    created_at: Some(prost_types::Timestamp {
+                        seconds: m.created_at,
+                        nanos: 0,
+                    }),
+                }));
+            }
+        }
+
+        let lookup_id = resolved_id.as_deref().unwrap_or(&req.job_id);
+
+        let jobs = self
+            .backend
+            .list(None)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to list jobs: {}", e)))?;
+
+        let job = jobs
+            .into_iter()
+            .find(|j| j.id == lookup_id || j.id.starts_with(lookup_id))
+            .ok_or_else(|| Status::not_found(format!("Job not found: {}", req.job_id)))?;
+
+        Ok(Response::new(GetJobStatusResponse {
+            id: job.id,
+            name: job.name,
+            status: job.status,
+            created_at: Some(prost_types::Timestamp {
+                seconds: job.created_at,
+                nanos: 0,
+            }),
+        }))
     }
 
     type GetJobLogsStream = ReceiverStream<Result<LogLine, Status>>;
@@ -200,7 +330,29 @@ impl JobService for AvixServer {
         request: Request<StopJobRequest>,
     ) -> Result<Response<StopJobResponse>, Status> {
         let req = request.into_inner();
-        self.backend.stop(&req.job_id).await
+
+        // If job is still queued, remove it and mark cancelled.
+        {
+            let mut q = self.queue.lock().await;
+            if let Some(pos) = q.iter().position(|j| j.queued_id == req.job_id) {
+                q.remove(pos);
+                let mut meta = self.queued_meta.lock().await;
+                if let Some(m) = meta.get_mut(&req.job_id) {
+                    m.status = "cancelled".to_string();
+                }
+                return Ok(Response::new(StopJobResponse { success: true }));
+            }
+        }
+
+        // If it's a queued id already mapped to backend id, stop the backend job.
+        let backend_id = {
+            let map = self.id_map.lock().await;
+            map.get(&req.job_id).cloned().unwrap_or(req.job_id)
+        };
+
+        self.backend
+            .stop(&backend_id)
+            .await
             .map_err(|e| Status::internal(format!("Failed to stop job: {}", e)))?;
 
         Ok(Response::new(StopJobResponse { success: true }))
@@ -222,7 +374,12 @@ fn parse_memory_gi(mem: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_memory_gi;
+    use super::{parse_memory_gi, AvixServer};
+    use crate::{Backend, JobStatus};
+    use anyhow::Result;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tonic::Request;
 
     #[test]
     fn test_parse_memory_gi() {
@@ -230,6 +387,139 @@ mod tests {
         assert!((parse_memory_gi("512Mi") - 0.5).abs() < 1e-6);
         assert!((parse_memory_gi("2G") - 2.0).abs() < 1e-6);
         assert!((parse_memory_gi("3") - 3.0).abs() < 1e-6);
+    }
+
+    struct MockBackend {
+        jobs: Vec<JobStatus>,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for MockBackend {
+        async fn submit(&self, _job: avix_spec::Job) -> Result<String> {
+            Ok("mock-id".to_string())
+        }
+
+        async fn stop(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _namespace: Option<&str>) -> Result<Vec<JobStatus>> {
+            Ok(self.jobs.clone())
+        }
+
+        async fn logs(&self, _id: &str, _follow: bool) -> Result<mpsc::Receiver<String>> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_job_status_exact_match() {
+        let backend = Arc::new(MockBackend {
+            jobs: vec![JobStatus {
+                id: "abc123".to_string(),
+                name: "job-a".to_string(),
+                status: "running".to_string(),
+                created_at: 123,
+            }],
+        });
+        let server = AvixServer::new(backend);
+
+        let resp = server
+            .get_job_status(Request::new(avix_spec::v1::GetJobStatusRequest {
+                job_id: "abc123".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.id, "abc123");
+        assert_eq!(resp.name, "job-a");
+        assert_eq!(resp.status, "running");
+        assert_eq!(resp.created_at.unwrap().seconds, 123);
+    }
+
+    #[tokio::test]
+    async fn test_get_job_status_prefix_match() {
+        let backend = Arc::new(MockBackend {
+            jobs: vec![JobStatus {
+                id: "abcdef012345".to_string(),
+                name: "job-b".to_string(),
+                status: "completed".to_string(),
+                created_at: 456,
+            }],
+        });
+        let server = AvixServer::new(backend);
+
+        let resp = server
+            .get_job_status(Request::new(avix_spec::v1::GetJobStatusRequest {
+                job_id: "abcdef".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.id, "abcdef012345");
+    }
+
+    #[tokio::test]
+    async fn test_get_job_status_not_found() {
+        let backend = Arc::new(MockBackend { jobs: vec![] });
+        let server = AvixServer::new(backend);
+
+        let err = server
+            .get_job_status(Request::new(avix_spec::v1::GetJobStatusRequest {
+                job_id: "missing".to_string(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_stop_job_cancels_queued_job() {
+        let backend = Arc::new(MockBackend { jobs: vec![] });
+        let server = AvixServer::new(backend);
+
+        let yaml = r#"apiVersion: avix.vargafoundation.org/v1alpha1
+kind: Job
+metadata:
+  name: queued-job
+spec:
+  priority: 0
+  execution:
+    image: alpine
+    command: [\"echo\", \"hi\"]
+"#;
+
+        let submit = server
+            .submit_job(Request::new(SubmitJobRequest {
+                job_spec_yaml: yaml.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(submit.status, "QUEUED");
+        assert!(submit.job_id.starts_with("q-"));
+
+        server
+            .stop_job(Request::new(StopJobRequest {
+                job_id: submit.job_id.clone(),
+            }))
+            .await
+            .unwrap();
+
+        let status = server
+            .get_job_status(Request::new(GetJobStatusRequest {
+                job_id: submit.job_id,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(status.status, "cancelled");
     }
 }
 
