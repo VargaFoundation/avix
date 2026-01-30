@@ -29,10 +29,22 @@ Avix is composed of:
 
 ### Installation
 
-To install the Avix CLI (requires Rust):
+```bash
+# Recommended: install an up-to-date Rust toolchain via rustup.
+# (Some distro packages ship older Cargo versions that can fail to build recent
+# transitive dependencies.)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Avix pins a compatible toolchain in `rust-toolchain.toml`.
+# With rustup installed, entering the repo will prompt you to install it (or you
+# can install it explicitly):
+rustup toolchain install 1.85.0
+```
+
+To install the Avix CLI:
 
 ```bash
-cargo install --path crates/avix-cli
+cargo install --locked --path crates/avix-cli
 ```
 
 ### Running locally
@@ -43,9 +55,18 @@ cargo install --path crates/avix-cli
    ```
 
 2. Submit a job (in another terminal):
-   ```bash
-   avix job submit examples/hello-world.yaml
-   ```
+   - Hello world (YAML):
+     ```bash
+     avix job submit examples/hello-world.yaml
+     ```
+   - Python script (uses `--from-py`, runs the script content in the container):
+     ```bash
+     avix job submit examples/train.py --from-py --backend local-docker
+     ```
+   - Workflow (sequence of jobs):
+     ```bash
+     avix job submit examples/workflow-hello-train.yaml
+     ```
 
 3. List jobs:
    ```bash
@@ -84,6 +105,38 @@ spec:
   execution:
     image: myregistry/inference:latest
     command: ["python", "inference.py"]
+```
+
+## Workflow Specification
+
+A workflow is a simple ordered list of jobs.
+
+```yaml
+apiVersion: avix.vargafoundation.org/v1alpha1
+kind: Workflow
+metadata:
+  name: hello-then-train
+spec:
+  onFailure: stop
+  jobs:
+    - apiVersion: avix.vargafoundation.org/v1alpha1
+      kind: Job
+      metadata:
+        name: hello-step
+      spec:
+        backend: local-docker
+        execution:
+          image: alpine
+          command: ["echo", "Hello from Avix workflow!"]
+    - apiVersion: avix.vargafoundation.org/v1alpha1
+      kind: Job
+      metadata:
+        name: train-step
+      spec:
+        backend: local-docker
+        execution:
+          image: python:3.11-slim
+          command: ["python", "-c", "print('hello')"]
 ```
 
 ## License

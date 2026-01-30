@@ -13,6 +13,8 @@ pub trait Backend {
     async fn stop(&self, id: &str) -> Result<()>;
     async fn list(&self, namespace: Option<&str>) -> Result<Vec<JobStatus>>;
     async fn logs(&self, id: &str, follow: bool) -> Result<tokio::sync::mpsc::Receiver<String>>;
+    /// Waits for job completion and returns the exit code (0 = success).
+    async fn wait(&self, id: &str) -> Result<i64>;
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +123,16 @@ impl Backend for DockerBackend {
         });
 
         Ok(rx)
+    }
+
+    async fn wait(&self, id: &str) -> Result<i64> {
+        let mut stream = self.docker.wait_container(id, None::<bollard::container::WaitContainerOptions<String>>);
+        if let Some(res) = stream.next().await {
+            let res = res?;
+            Ok(res.status_code)
+        } else {
+            Ok(-1)
+        }
     }
 }
 

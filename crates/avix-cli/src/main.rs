@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use anyhow::Result;
 use colored::*;
-use avix_spec::Job;
+use avix_spec::{Job, Workflow};
 use avix_spec::v1::job_service_client::JobServiceClient;
 use avix_spec::v1::*;
 use std::fs;
@@ -12,6 +12,12 @@ use tabled::{Table, Tabled, settings::{Style, Color, object::Columns}};
 use indicatif::{ProgressBar, ProgressStyle};
 use console::style;
 use chrono::Local;
+use serde_yaml::Value;
+
+fn extract_kind(yaml: &str) -> Result<Option<String>> {
+    let v: Value = serde_yaml::from_str(yaml)?;
+    Ok(v.get("kind").and_then(|k| k.as_str()).map(|s| s.to_string()))
+}
 
 mod tui;
 
@@ -469,10 +475,29 @@ async fn submit_python_job(
         None
     };
     
-    let mut command = vec!["python".to_string(), format!("/app/{}", script_name)];
-    if let Some(script_args) = args {
-        command.extend(script_args.split_whitespace().map(|s| s.to_string()));
+    // Execute the script content directly (no file mounting/build step).
+    // Also installs optional `# pip:` requirements before running.
+    let mut sh_script = String::from("set -e\n");
+    if !requirements.is_empty() {
+        sh_script.push_str("python -m pip install --no-cache-dir ");
+        sh_script.push_str(&requirements.join(" "));
+        sh_script.push('\n');
     }
+    sh_script.push_str("python -");
+    // Keep args parsing simple: pass the user args via sh/positional is out of scope,
+    // so we append them to the python invocation directly.
+    if let Some(script_args) = args {
+        sh_script.push_str(" ");
+        sh_script.push_str(script_args);
+    }
+    sh_script.push_str(" <<'PY'\n");
+    sh_script.push_str(&script_content);
+    if !script_content.ends_with('\n') {
+        sh_script.push('\n');
+    }
+    sh_script.push_str("PY\n");
+
+    let command = vec!["sh".to_string(), "-lc".to_string(), sh_script];
     
     let job = Job {
         api_version: "avix.vargafoundation.org/v1alpha1".to_string(),
@@ -579,39 +604,68 @@ async fn submit_job(
     
     spinner.set_message(format!("Reading job spec from {}...", file.display()));
     let content = fs::read_to_string(file)?;
-    let mut job: Job = serde_yaml::from_str(&content)?;
-    
-    if let Some(b) = backend {
-        job.spec.backend = Some(b.to_string());
-    }
-    
-    spinner.finish_and_clear();
-    
-    // Display job summary
-    println!("\n{}", "Job Summary:".white().bold());
-    println!("  {} {}", "Name:".dimmed(), job.metadata.name.cyan());
-    println!("  {} {}", "Image:".dimmed(), job.spec.execution.image.yellow());
-    println!("  {} {}", "Backend:".dimmed(), job.spec.backend.as_deref().unwrap_or("auto").green());
-    if let Some(ref res) = job.spec.resources {
-        if let Some(ref cpu) = res.cpu {
-            println!("  {} {}", "CPU:".dimmed(), cpu);
+    let kind = extract_kind(&content)?;
+
+    let yaml_to_send = match kind.as_deref() {
+        Some("Workflow") => {
+            let mut wf: Workflow = serde_yaml::from_str(&content)?;
+            if let Some(b) = backend {
+                for j in wf.spec.jobs.iter_mut() {
+                    j.spec.backend = Some(b.to_string());
+                }
+            }
+
+            spinner.finish_and_clear();
+            println!("\n{}", "Workflow Summary:".white().bold());
+            println!("  {} {}", "Name:".dimmed(), wf.metadata.name.cyan());
+            println!("  {} {}", "Steps:".dimmed(), wf.spec.jobs.len().to_string().yellow());
+            for (i, j) in wf.spec.jobs.iter().enumerate() {
+                println!("    {} {}  {} {}", format!("{}.", i + 1).dimmed(), j.metadata.name.cyan(), "Image:".dimmed(), j.spec.execution.image.yellow());
+            }
+
+            if dry_run {
+                print_warning("Dry run mode - workflow not submitted");
+                println!("\n{}", "Generated YAML:".white().bold());
+                println!("{}", serde_yaml::to_string(&wf)?);
+                return Ok(());
+            }
+
+            serde_yaml::to_string(&wf)?
         }
-        if let Some(ref mem) = res.memory {
-            println!("  {} {}", "Memory:".dimmed(), mem);
+        _ => {
+            let mut job: Job = serde_yaml::from_str(&content)?;
+            if let Some(b) = backend {
+                job.spec.backend = Some(b.to_string());
+            }
+
+            spinner.finish_and_clear();
+            // Display job summary
+            println!("\n{}", "Job Summary:".white().bold());
+            println!("  {} {}", "Name:".dimmed(), job.metadata.name.cyan());
+            println!("  {} {}", "Image:".dimmed(), job.spec.execution.image.yellow());
+            println!("  {} {}", "Backend:".dimmed(), job.spec.backend.as_deref().unwrap_or("auto").green());
+            if let Some(ref res) = job.spec.resources {
+                if let Some(ref cpu) = res.cpu {
+                    println!("  {} {}", "CPU:".dimmed(), cpu);
+                }
+                if let Some(ref mem) = res.memory {
+                    println!("  {} {}", "Memory:".dimmed(), mem);
+                }
+                if let Some(gpu) = res.gpu {
+                    println!("  {} {}", "GPU:".dimmed(), gpu);
+                }
+            }
+
+            if dry_run {
+                print_warning("Dry run mode - job not submitted");
+                println!("\n{}", "Generated YAML:".white().bold());
+                println!("{}", serde_yaml::to_string(&job)?);
+                return Ok(());
+            }
+
+            serde_yaml::to_string(&job)?
         }
-        if let Some(gpu) = res.gpu {
-            println!("  {} {}", "GPU:".dimmed(), gpu);
-        }
-    }
-    
-    if dry_run {
-        print_warning("Dry run mode - job not submitted");
-        println!("\n{}", "Generated YAML:".white().bold());
-        println!("{}", serde_yaml::to_string(&job)?);
-        return Ok(());
-    }
-    
-    let yaml_to_send = serde_yaml::to_string(&job)?;
+    };
     
     let pb = ProgressBar::new_spinner();
     pb.set_style(ProgressStyle::default_spinner()
@@ -1466,59 +1520,79 @@ fn validate_job(file: &PathBuf) -> Result<()> {
     let content = fs::read_to_string(file)?;
     
     spinner.set_message("Parsing YAML...");
-    let job: Result<Job, _> = serde_yaml::from_str(&content);
+    let kind = extract_kind(&content)?;
     
-    spinner.finish_and_clear();
-    
-    match job {
-        Ok(job) => {
-            print_success("Job specification is valid!");
-            
-            println!("\n{}", "Job Summary:".white().bold());
-            println!("  {} {}", "Name:".dimmed(), job.metadata.name.cyan());
-            println!("  {} {}", "API Version:".dimmed(), job.api_version);
-            println!("  {} {}", "Kind:".dimmed(), job.kind);
-            println!("  {} {}", "Image:".dimmed(), job.spec.execution.image.yellow());
-            println!("  {} {}", "Backend:".dimmed(), job.spec.backend.as_deref().unwrap_or("auto").green());
-            
-            if let Some(ref res) = job.spec.resources {
-                println!("\n{}", "Resources:".white().bold());
-                if let Some(ref cpu) = res.cpu {
-                    println!("  {} {} cores", "CPU:".dimmed(), cpu);
+    match kind.as_deref() {
+        Some("Workflow") => {
+            let wf: Result<Workflow, _> = serde_yaml::from_str(&content);
+            match wf {
+                Ok(wf) => {
+                    print_success("Workflow specification is valid!");
+                    println!("\n{}", "Workflow Summary:".white().bold());
+                    println!("  {} {}", "Name:".dimmed(), wf.metadata.name.cyan());
+                    println!("  {} {}", "Kind:".dimmed(), wf.kind);
+                    println!("  {} {}", "Steps:".dimmed(), wf.spec.jobs.len().to_string().yellow());
                 }
-                if let Some(ref mem) = res.memory {
-                    println!("  {} {}", "Memory:".dimmed(), mem);
-                }
-                if let Some(gpu) = res.gpu {
-                    println!("  {} {}", "GPU:".dimmed(), gpu);
-                }
-            }
-            
-            // Warnings
-            let mut warnings = Vec::new();
-            if job.spec.backend.is_none() {
-                warnings.push("No backend specified, will use 'auto'");
-            }
-            if job.spec.resources.is_none() {
-                warnings.push("No resources specified, defaults will be used");
-            }
-            if job.spec.queue.is_none() {
-                warnings.push("No queue specified, will use 'default'");
-            }
-            
-            if !warnings.is_empty() {
-                println!("\n{}", "Warnings:".yellow().bold());
-                for w in warnings {
-                    print_warning(w);
+                Err(e) => {
+                    print_error("Workflow specification is invalid!");
+                    println!("\n{}", "Error details:".red().bold());
+                    println!("  {}", e);
                 }
             }
         }
-        Err(e) => {
-            print_error("Job specification is invalid!");
-            println!("\n{}", "Error details:".red().bold());
-            println!("  {}", e);
+        _ => {
+            let job: Result<Job, _> = serde_yaml::from_str(&content);
+            match job {
+                Ok(job) => {
+                    print_success("Job specification is valid!");
+
+                    println!("\n{}", "Job Summary:".white().bold());
+                    println!("  {} {}", "Name:".dimmed(), job.metadata.name.cyan());
+                    println!("  {} {}", "API Version:".dimmed(), job.api_version);
+                    println!("  {} {}", "Kind:".dimmed(), job.kind);
+                    println!("  {} {}", "Image:".dimmed(), job.spec.execution.image.yellow());
+                    println!("  {} {}", "Backend:".dimmed(), job.spec.backend.as_deref().unwrap_or("auto").green());
+
+                    if let Some(ref res) = job.spec.resources {
+                        println!("\n{}", "Resources:".white().bold());
+                        if let Some(ref cpu) = res.cpu {
+                            println!("  {} {} cores", "CPU:".dimmed(), cpu);
+                        }
+                        if let Some(ref mem) = res.memory {
+                            println!("  {} {}", "Memory:".dimmed(), mem);
+                        }
+                        if let Some(gpu) = res.gpu {
+                            println!("  {} {}", "GPU:".dimmed(), gpu);
+                        }
+                    }
+
+                    // Warnings
+                    let mut warnings = Vec::new();
+                    if job.spec.backend.is_none() {
+                        warnings.push("No backend specified, will use 'auto'");
+                    }
+                    if job.spec.resources.is_none() {
+                        warnings.push("No resources specified, defaults will be used");
+                    }
+                    if job.spec.queue.is_none() {
+                        warnings.push("No queue specified, will use 'default'");
+                    }
+
+                    if !warnings.is_empty() {
+                        println!("\n{}", "Warnings:".yellow().bold());
+                        for w in warnings {
+                            print_warning(w);
+                        }
+                    }
+                }
+                Err(e) => {
+                    print_error("Job specification is invalid!");
+                    println!("\n{}", "Error details:".red().bold());
+                    println!("  {}", e);
+                }
+            }
         }
-    }
+    };
     
     Ok(())
 }

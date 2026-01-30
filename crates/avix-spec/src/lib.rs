@@ -12,6 +12,24 @@ pub struct Job {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct Workflow {
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: Metadata,
+    pub spec: WorkflowSpec,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowSpec {
+    /// Ordered list of jobs to run.
+    pub jobs: Vec<Job>,
+    /// What to do when a step fails. Supported: "stop" (default) | "continue".
+    pub on_failure: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Metadata {
     pub name: String,
     pub namespace: Option<String>,
@@ -428,5 +446,32 @@ spec:
         assert!(resources.cpu.is_some());
         assert!(resources.memory.is_none());
         assert!(resources.gpu.is_none());
+    }
+
+    #[test]
+    fn test_workflow_deserialization_minimal() {
+        let yaml = r#"
+apiVersion: avix.vargafoundation.org/v1alpha1
+kind: Workflow
+metadata:
+  name: wf-min
+spec:
+  jobs:
+    - apiVersion: avix.vargafoundation.org/v1alpha1
+      kind: Job
+      metadata:
+        name: step-1
+      spec:
+        execution:
+          image: alpine
+          command: [\"echo\", \"hi\"]
+"#;
+
+        let wf: Workflow = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(wf.kind, "Workflow");
+        assert_eq!(wf.metadata.name, "wf-min");
+        assert_eq!(wf.spec.jobs.len(), 1);
+        assert_eq!(wf.spec.jobs[0].metadata.name, "step-1");
+        assert_eq!(wf.spec.jobs[0].spec.execution.image, "alpine");
     }
 }

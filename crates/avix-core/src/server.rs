@@ -6,12 +6,14 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use std::collections::{HashMap, VecDeque};
+use serde_yaml::Value;
 
 pub struct AvixServer {
     backend: Arc<dyn Backend + Send + Sync>,
     queue: Arc<Mutex<VecDeque<QueuedJob>>>,
     queued_meta: Arc<Mutex<HashMap<String, QueuedMeta>>>,
     id_map: Arc<Mutex<HashMap<String, String>>>,
+    workflow_meta: Arc<Mutex<HashMap<String, WorkflowMeta>>>,
 }
 
 #[derive(Clone)]
@@ -28,11 +30,20 @@ struct QueuedMeta {
     created_at: i64,
 }
 
+#[derive(Clone)]
+struct WorkflowMeta {
+    name: String,
+    status: String,
+    created_at: i64,
+    step_ids: Vec<String>,
+}
+
 impl AvixServer {
     pub fn new(backend: Arc<dyn Backend + Send + Sync>) -> Self {
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let queued_meta = Arc::new(Mutex::new(HashMap::new()));
         let id_map = Arc::new(Mutex::new(HashMap::new()));
+        let workflow_meta = Arc::new(Mutex::new(HashMap::new()));
         let backend_clone = backend.clone();
         let queue_clone = queue.clone();
         let queued_meta_clone = queued_meta.clone();
@@ -81,12 +92,25 @@ impl AvixServer {
             queue,
             queued_meta,
             id_map,
+            workflow_meta,
         }
     }
 }
 
 fn generate_queued_id() -> String {
     format!("q-{:x}", rand::random::<u64>())
+}
+
+fn generate_workflow_id() -> String {
+    format!("wf-{:x}", rand::random::<u64>())
+}
+
+fn extract_kind(yaml: &str) -> Result<Option<String>, serde_yaml::Error> {
+    let v: Value = serde_yaml::from_str(yaml)?;
+    Ok(v
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .map(|s| s.to_string()))
 }
 
 #[tonic::async_trait]
@@ -96,6 +120,94 @@ impl JobService for AvixServer {
         request: Request<SubmitJobRequest>,
     ) -> Result<Response<SubmitJobResponse>, Status> {
         let req = request.into_inner();
+        let kind = extract_kind(&req.job_spec_yaml)
+            .map_err(|e| Status::invalid_argument(format!("Invalid YAML: {}", e)))?;
+
+        if kind.as_deref() == Some("Workflow") {
+            let workflow: avix_spec::Workflow = serde_yaml::from_str(&req.job_spec_yaml)
+                .map_err(|e| Status::invalid_argument(format!("Invalid Workflow YAML: {}", e)))?;
+
+            let wf_id = generate_workflow_id();
+            let now = chrono::Utc::now().timestamp();
+            {
+                let mut meta = self.workflow_meta.lock().await;
+                meta.insert(
+                    wf_id.clone(),
+                    WorkflowMeta {
+                        name: workflow.metadata.name.clone(),
+                        status: "running".to_string(),
+                        created_at: now,
+                        step_ids: Vec::new(),
+                    },
+                );
+            }
+
+            let backend = self.backend.clone();
+            let workflow_meta = self.workflow_meta.clone();
+
+            tokio::spawn(async move {
+                let mut step_ids: Vec<String> = Vec::new();
+                let on_failure = workflow
+                    .spec
+                    .on_failure
+                    .as_deref()
+                    .unwrap_or("stop")
+                    .to_string();
+
+                for job in workflow.spec.jobs.into_iter() {
+                    match backend.submit(job).await {
+                        Ok(id) => {
+                            step_ids.push(id.clone());
+                            {
+                                let mut meta = workflow_meta.lock().await;
+                                if let Some(m) = meta.get_mut(&wf_id) {
+                                    m.step_ids = step_ids.clone();
+                                    m.status = "running".to_string();
+                                }
+                            }
+
+                            match backend.wait(&id).await {
+                                Ok(code) if code == 0 => {}
+                                Ok(_code) => {
+                                    if on_failure != "continue" {
+                                        let mut meta = workflow_meta.lock().await;
+                                        if let Some(m) = meta.get_mut(&wf_id) {
+                                            m.status = "failed".to_string();
+                                        }
+                                        return;
+                                    }
+                                }
+                                Err(_) => {
+                                    let mut meta = workflow_meta.lock().await;
+                                    if let Some(m) = meta.get_mut(&wf_id) {
+                                        m.status = "failed".to_string();
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let mut meta = workflow_meta.lock().await;
+                            if let Some(m) = meta.get_mut(&wf_id) {
+                                m.status = "failed".to_string();
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                let mut meta = workflow_meta.lock().await;
+                if let Some(m) = meta.get_mut(&wf_id) {
+                    m.status = "completed".to_string();
+                }
+            });
+
+            return Ok(Response::new(SubmitJobResponse {
+                job_id: wf_id,
+                status: "SUBMITTED".to_string(),
+            }));
+        }
+
         let job: avix_spec::Job = serde_yaml::from_str(&req.job_spec_yaml)
             .map_err(|e| Status::invalid_argument(format!("Invalid YAML: {}", e)))?;
 
@@ -157,6 +269,17 @@ impl JobService for AvixServer {
             });
         }
 
+        // Add workflows (in-memory)
+        let workflows = self.workflow_meta.lock().await;
+        for (id, meta) in workflows.iter() {
+            jobs.push(crate::JobStatus {
+                id: id.clone(),
+                name: meta.name.clone(),
+                status: meta.status.clone(),
+                created_at: meta.created_at,
+            });
+        }
+
         let summaries = jobs.into_iter().map(|j| JobSummary {
             id: j.id,
             name: j.name,
@@ -175,6 +298,22 @@ impl JobService for AvixServer {
         request: Request<GetJobStatusRequest>,
     ) -> Result<Response<GetJobStatusResponse>, Status> {
         let req = request.into_inner();
+
+        // Workflow status is tracked in-memory.
+        {
+            let workflows = self.workflow_meta.lock().await;
+            if let Some(m) = workflows.get(&req.job_id) {
+                return Ok(Response::new(GetJobStatusResponse {
+                    id: req.job_id,
+                    name: m.name.clone(),
+                    status: m.status.clone(),
+                    created_at: Some(prost_types::Timestamp {
+                        seconds: m.created_at,
+                        nanos: 0,
+                    }),
+                }));
+            }
+        }
 
         // If it's a queued id that already mapped to a backend id, resolve it.
         let resolved_id = {
@@ -331,6 +470,15 @@ impl JobService for AvixServer {
     ) -> Result<Response<StopJobResponse>, Status> {
         let req = request.into_inner();
 
+        // If it's a workflow id, mark cancelled (best-effort).
+        {
+            let mut meta = self.workflow_meta.lock().await;
+            if let Some(m) = meta.get_mut(&req.job_id) {
+                m.status = "cancelled".to_string();
+                return Ok(Response::new(StopJobResponse { success: true }));
+            }
+        }
+
         // If job is still queued, remove it and mark cancelled.
         {
             let mut q = self.queue.lock().await;
@@ -410,6 +558,10 @@ mod tests {
         async fn logs(&self, _id: &str, _follow: bool) -> Result<mpsc::Receiver<String>> {
             let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
+        }
+
+        async fn wait(&self, _id: &str) -> Result<i64> {
+            Ok(0)
         }
     }
 

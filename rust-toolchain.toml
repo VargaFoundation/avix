@@ -1,0 +1,6 @@
+[toolchain]
+# `avix` depends on some crates that require a fairly recent stable Rust.
+# Pinning the toolchain avoids confusing build failures with older distro-packaged
+# Cargo/Rust (e.g., 1.75.0).
+channel = "1.85.0"
+profile = "minimal"

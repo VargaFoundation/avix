@@ -1,0 +1,37 @@
+apiVersion: avix.vargafoundation.org/v1alpha1
+kind: Workflow
+metadata:
+  name: hello-then-train
+spec:
+  onFailure: stop
+  jobs:
+    - apiVersion: avix.vargafoundation.org/v1alpha1
+      kind: Job
+      metadata:
+        name: hello-step
+      spec:
+        backend: local-docker
+        execution:
+          image: alpine
+          command: ["echo", "Hello from Avix workflow!"]
+    - apiVersion: avix.vargafoundation.org/v1alpha1
+      kind: Job
+      metadata:
+        name: train-step
+      spec:
+        backend: local-docker
+        execution:
+          image: python:3.11-slim
+          command:
+            - sh
+            - -lc
+            - |
+              set -e
+              python -m pip install --no-cache-dir numpy
+              python - <<'PY'
+              import numpy as np
+
+              for epoch in range(3):
+                  loss = 1.0 / (epoch + 1) + np.random.random() * 0.1
+                  print(f"epoch={epoch+1} loss={loss:.4f}")
+              PY

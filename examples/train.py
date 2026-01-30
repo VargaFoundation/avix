@@ -1,7 +1,7 @@
 # pip: numpy, pandas, scikit-learn
 """
 Example ML training script for Avix.
-Submit with: avix job submit examples/train.py --backend local-docker
+Submit with: avix job submit examples/train.py --from-py --backend local-docker
 """
 
 import argparse
